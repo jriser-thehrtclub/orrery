@@ -153,31 +153,75 @@ export class QueryExecutor {
   /**
    * Execute multiple queries in parallel. Each query is independent.
    * Deduplication happens automatically through execute().
+   *
+   * Dispatch is throttled per-connection via each connection's
+   * max_concurrent_queries setting (optional; unset means every query for
+   * that connection dispatches at once, same as before this existed).
+   * Grouping by connection matters because the thing being protected — the
+   * connection's pool — is itself per-connection, so a throttle on one
+   * connection shouldn't affect queries running against another.
    */
   async executeAll(
     queries: QueryOptions[],
   ): Promise<Map<number, QueryResult | QueryExecutionError>> {
     const results = new Map<number, QueryResult | QueryExecutionError>();
-    const promises = queries.map((q, i) =>
-      this.execute(q)
-        .then((result) => results.set(i, result))
-        .catch((err) => {
-          if (err instanceof QueryExecutionError) {
-            results.set(i, err);
-          } else {
-            results.set(
-              i,
-              new QueryExecutionError({
-                type: "sql_error",
-                message: err instanceof Error ? err.message : String(err),
-                sql: q.sql,
-              }),
-            );
-          }
-        }),
+
+    const byConnection = new Map<string, number[]>();
+    queries.forEach((q, i) => {
+      const indices = byConnection.get(q.connection) ?? [];
+      indices.push(i);
+      byConnection.set(q.connection, indices);
+    });
+
+    await Promise.all(
+      [...byConnection.entries()].map(([connectionName, indices]) =>
+        this.dispatchLimited(connectionName, indices, queries, results),
+      ),
     );
-    await Promise.all(promises);
+
     return results;
+  }
+
+  /**
+   * Runs `indices` (into `queries`) against one connection using at most
+   * N concurrent lanes, where N is that connection's max_concurrent_queries
+   * (or all of them at once if unset). Lanes pull off a shared cursor rather
+   * than fixed batches, so a lane that finishes early immediately starts the
+   * next query instead of waiting for the rest of its batch.
+   */
+  private async dispatchLimited(
+    connectionName: string,
+    indices: number[],
+    queries: QueryOptions[],
+    results: Map<number, QueryResult | QueryExecutionError>,
+  ): Promise<void> {
+    const limit = this.connectionManager.getMaxConcurrentQueries(connectionName);
+    const laneCount =
+      limit && limit > 0 ? Math.min(limit, indices.length) : indices.length;
+
+    let cursor = 0;
+    const runLane = async (): Promise<void> => {
+      while (cursor < indices.length) {
+        const i = indices[cursor++];
+        const q = queries[i];
+        try {
+          results.set(i, await this.execute(q));
+        } catch (err) {
+          results.set(
+            i,
+            err instanceof QueryExecutionError
+              ? err
+              : new QueryExecutionError({
+                  type: "sql_error",
+                  message: err instanceof Error ? err.message : String(err),
+                  sql: q.sql,
+                }),
+          );
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: laneCount }, runLane));
   }
 
   /**

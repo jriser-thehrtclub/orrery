@@ -50,6 +50,8 @@ function rawEntryToConfig(entry: RawConnectionEntry): ConnectionConfig {
   if (rest.connection_string !== undefined)
     config.connection_string = rest.connection_string as string;
   if (rest.pool_size !== undefined) config.pool_size = Number(rest.pool_size);
+  if (rest.max_concurrent_queries !== undefined)
+    config.max_concurrent_queries = Number(rest.max_concurrent_queries);
   if (rest.timeout !== undefined) config.timeout = Number(rest.timeout);
   if (rest.options !== undefined)
     config.options = rest.options as Record<string, unknown>;

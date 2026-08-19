@@ -112,6 +112,14 @@ export class ConnectionManager {
     return entry.driver;
   }
 
+  /**
+   * Per-connection throttle for executeAll's concurrent dispatch. Not part of
+   * ConnectionInfo since that's the sanitized public view (no config internals).
+   */
+  getMaxConcurrentQueries(name: string): number | undefined {
+    return this.connections.get(name)?.config.max_concurrent_queries;
+  }
+
   getConnection(name: string): ConnectionInfo | undefined {
     const entry = this.connections.get(name);
     if (!entry) return undefined;

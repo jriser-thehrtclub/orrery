@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { QueryExecutor, QueryExecutionError } from "../../src/query/executor.js";
 import { ConnectionManager } from "../../src/connections/manager.js";
 
@@ -251,5 +251,92 @@ describe("QueryExecutor (SQLite integration)", () => {
     await expect(
       executor.execute({ sql: "SELECT 1", connection: "no_such_conn" }),
     ).rejects.toThrow("not found");
+  });
+});
+
+describe("executeAll concurrency throttle", () => {
+  let cm: ConnectionManager;
+
+  afterEach(async () => {
+    await cm.disconnectAll();
+  });
+
+  /** Stubs `execute` with a timed, concurrency-counting fake so we can
+   * observe dispatch shape without depending on a driver that's actually
+   * async under the hood (better-sqlite3 is synchronous). */
+  function trackConcurrency(executor: QueryExecutor) {
+    const current = new Map<string, number>();
+    const max = new Map<string, number>();
+    const spy = vi
+      .spyOn(executor, "execute")
+      .mockImplementation(async (opts) => {
+        const conn = opts.connection;
+        const next = (current.get(conn) ?? 0) + 1;
+        current.set(conn, next);
+        max.set(conn, Math.max(max.get(conn) ?? 0, next));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        current.set(conn, next - 1);
+        return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
+      });
+    return { spy, max };
+  }
+
+  it("dispatches fully in parallel when max_concurrent_queries is unset", async () => {
+    cm = new ConnectionManager();
+    await cm.register("unthrottled", { type: "sqlite", path: ":memory:" });
+    const executor = new QueryExecutor(cm);
+    const { max } = trackConcurrency(executor);
+
+    await executor.executeAll(
+      Array.from({ length: 4 }, () => ({
+        sql: "SELECT 1",
+        connection: "unthrottled",
+      })),
+    );
+
+    expect(max.get("unthrottled")).toBe(4);
+  });
+
+  it("caps concurrent dispatch at the connection's max_concurrent_queries", async () => {
+    cm = new ConnectionManager();
+    await cm.register("throttled", {
+      type: "sqlite",
+      path: ":memory:",
+      max_concurrent_queries: 2,
+    });
+    const executor = new QueryExecutor(cm);
+    const { max } = trackConcurrency(executor);
+
+    await executor.executeAll(
+      Array.from({ length: 5 }, () => ({
+        sql: "SELECT 1",
+        connection: "throttled",
+      })),
+    );
+
+    expect(max.get("throttled")).toBe(2);
+  });
+
+  it("throttles per-connection without affecting other connections in the same batch", async () => {
+    cm = new ConnectionManager();
+    await cm.register("slow", {
+      type: "sqlite",
+      path: ":memory:",
+      max_concurrent_queries: 1,
+    });
+    await cm.register("fast", { type: "sqlite", path: ":memory:" });
+    const executor = new QueryExecutor(cm);
+    const { max } = trackConcurrency(executor);
+
+    await executor.executeAll([
+      { sql: "SELECT 1", connection: "slow" },
+      { sql: "SELECT 1", connection: "slow" },
+      { sql: "SELECT 1", connection: "fast" },
+      { sql: "SELECT 1", connection: "fast" },
+      { sql: "SELECT 1", connection: "fast" },
+    ]);
+
+    expect(max.get("slow")).toBe(1);
+    expect(max.get("fast")).toBe(3);
   });
 });

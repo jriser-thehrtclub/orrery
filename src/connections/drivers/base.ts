@@ -11,6 +11,7 @@ export interface ConnectionConfig {
   ssl?: boolean;
   connection_string?: string;
   pool_size?: number;
+  max_concurrent_queries?: number;
   timeout?: number;
   options?: Record<string, unknown>;
 }
